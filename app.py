@@ -9,7 +9,7 @@ Run:
 
 import os
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import plotly.graph_objects as go
@@ -121,21 +121,23 @@ def load_model_artifact() -> Dict[str, Any]:
 INCONCLUSIVE_LABEL = "__inconclusive__"
 
 
-def predict_label(artifact: Dict[str, Any], description: str) -> Tuple[str, float]:
+def predict_label(
+    artifact: Dict[str, Any], description: str
+) -> Tuple[str, float, Dict[str, float]]:
     """
     Run the ML pipeline on the description text.
 
-    Returns (raw_label, max_proba) where raw_label is the original class string
-    (e.g. 'fraudulent', 'legitimate', 'suspicious') or INCONCLUSIVE_LABEL when
-    the model's maximum class probability is below the saved threshold.
+    Returns (raw_label, max_proba, all_probas) where:
+      raw_label  — original class string or INCONCLUSIVE_LABEL
+      max_proba  — highest class probability
+      all_probas — dict {class_name: probability} for all classes
 
-    The threshold is read from the artifact so it stays in sync with training.
-    If the artifact pre-dates this field, 0.45 is used as a safe default.
+    The threshold is read from the artifact (default 0.55).
     """
     pipeline      = artifact["pipeline"]
     label_encoder = artifact.get("label_encoder")
     class_names   = artifact.get("class_names", [])
-    threshold     = float(artifact.get("inconclusive_threshold", 0.45))
+    threshold     = float(artifact.get("inconclusive_threshold", 0.55))
 
     text_input = [str(description).strip()]
 
@@ -149,11 +151,14 @@ def predict_label(artifact: Dict[str, Any], description: str) -> Tuple[str, floa
             raw_label = class_names[int(numeric_pred)]
         else:
             raw_label = str(numeric_pred)
-        return raw_label, 0.0
+        return raw_label, 0.0, {}
 
     proba     = pipeline.predict_proba(text_input)[0]
     max_proba = float(max(proba))
     pred_idx  = int(proba.argmax())
+
+    # Build full probability dict aligned to class_names
+    all_probas = {cls: float(p) for cls, p in zip(class_names, proba)}
 
     # Decode the predicted class index to its original string label
     if label_encoder is not None:
@@ -165,9 +170,9 @@ def predict_label(artifact: Dict[str, Any], description: str) -> Tuple[str, floa
 
     # If confidence is too low, report as inconclusive rather than misleading
     if max_proba < threshold:
-        return INCONCLUSIVE_LABEL, max_proba
+        return INCONCLUSIVE_LABEL, max_proba, all_probas
 
-    return raw_label, max_proba
+    return raw_label, max_proba, all_probas
 
 
 def map_label_to_dashboard(raw_label: str) -> Dict[str, str]:
@@ -411,30 +416,96 @@ def render_header() -> None:
     """, unsafe_allow_html=True)
 
 
-def render_ml_result(raw_label: str, confidence: float, artifact: Dict[str, Any]) -> None:
-    """Render the ML classification card."""
+def render_ml_result(
+    raw_label: str, confidence: float, artifact: Dict[str, Any], warning_count: int = 0,
+    all_probas: Optional[Dict[str, float]] = None
+) -> None:
+    """Render the ML classification card.
+
+    all_probas: optional dict mapping class name -> probability (0-1), used to
+    display the full per-class breakdown so the user can see how close the
+    three classes are.
+    """
     display_map = map_label_to_dashboard(raw_label)
     card_cls    = display_map["card"]
     badge_cls   = display_map["badge"]
     display_lbl = display_map["display"]
-    threshold   = float(artifact.get("inconclusive_threshold", 0.45))
+    threshold   = float(artifact.get("inconclusive_threshold", 0.55))
+    class_names = artifact.get("class_names", [])
 
     # Training accuracy from artifact metrics
     train_acc = artifact.get("metrics", {}).get("accuracy")
     acc_note  = f" | Model accuracy: {train_acc*100:.1f}%" if train_acc else ""
 
     is_inconclusive = (raw_label == INCONCLUSIVE_LABEL)
+    label_lower     = raw_label.lower()
+
+    # ── Per-class probability bar ──────────────────────────────────────────────
+    # Shown whenever we have the full probability vector.  Lets the user see how
+    # close the three classes are, which is the key information when confidence
+    # is marginal.
+    proba_bar_html = ""
+    if all_probas:
+        rows = ""
+        bar_colours = {
+            "fraudulent": "#ef5350",
+            "legitimate": "#66bb6a",
+            "suspicious": "#ffa726",
+        }
+        for cls in class_names:
+            p   = all_probas.get(cls, 0.0)
+            pct = round(p * 100, 1)
+            col = bar_colours.get(cls, "#4fc3f7")
+            rows += (
+                f'<tr>'
+                f'<td style="color:#8fa3b8;width:90px;font-size:0.8rem;">{cls}</td>'
+                f'<td style="width:140px;">'
+                f'  <div style="background:#1e3a5f;border-radius:3px;height:8px;">'
+                f'    <div style="background:{col};width:{pct}%;height:100%;border-radius:3px;"></div>'
+                f'  </div>'
+                f'</td>'
+                f'<td style="color:#8fa3b8;font-size:0.8rem;padding-left:6px;">{pct}%</td>'
+                f'</tr>'
+            )
+        proba_bar_html = (
+            f'<table style="border-collapse:collapse;margin:0.5rem 0 0.2rem;">'
+            f'{rows}</table>'
+        )
+
+    # ── False-positive note ────────────────────────────────────────────────────
+    # Shown when the model predicts suspicious/fraudulent but no rule-based
+    # warning phrases fired.  The specific signal context (entry-level sales,
+    # business development) comes from corpus analysis of the training data.
+    is_flagged_no_warnings = (
+        not is_inconclusive
+        and warning_count == 0
+        and ("suspicious" in label_lower or "suspect" in label_lower or "fraud" in label_lower)
+    )
+    false_positive_note = (
+        '<p class="muted" style="margin-top:0.4rem; border-top:1px solid #1e3a5f; padding-top:0.4rem;">'
+        '<strong>Note:</strong> The ML model flagged this posting, but no configured warning '
+        'phrases were detected. This is likely a false positive — phrases such as '
+        '"entry level sales", "business development", "no experience required", '
+        '"work from home", and "no screening questions" are disproportionately '
+        'associated with the suspicious label in the training data, even when the '
+        'posting itself contains no scam signals. '
+        'Please verify the posting independently before drawing any conclusions.'
+        '</p>'
+        if is_flagged_no_warnings else ""
+    )
 
     if is_inconclusive:
-        # Explain why we are not making a call
         conf_html = (
             f'<p class="muted" style="margin-top:0.5rem;">'
-            f'Max class probability: <strong>{confidence*100:.1f}%</strong>'
+            f'Highest class probability: <strong>{confidence*100:.1f}%</strong>'
             f' — below the {threshold*100:.0f}% threshold required for a confident prediction.'
             f'</p>'
             f'<p class="muted">'
-            f'The model cannot reliably distinguish between classes for this text.'
-            f' Inspect the rule-based warnings below and verify independently.'
+            f'The model cannot reliably separate the three classes for this text. '
+            f'This often happens when the description does not contain strong signals '
+            f'in either direction, or when it uses phrases common to both legitimate '
+            f'and suspicious postings (e.g. "entry level", "work from home"). '
+            f'Inspect the rule-based warnings below and verify the posting independently.'
             f'</p>'
         )
         label_note = "Inconclusive"
@@ -451,6 +522,8 @@ def render_ml_result(raw_label: str, confidence: float, artifact: Dict[str, Any]
     <div class="card {card_cls}">
       <span class="badge {badge_cls}">{display_lbl}</span>
       {conf_html}
+      {proba_bar_html}
+      {false_positive_note}
       <p class="muted">ML classification ({label_note}){acc_note}</p>
       <p class="muted"><em>This is an automated analysis only. Always verify internships independently.</em></p>
     </div>
@@ -636,10 +709,14 @@ def render_limitations() -> None:
       <ul style="color:#8fa3b8; font-size:0.88rem; padding-left:1.2rem;">
         <li>InternAI uses machine learning and rule-based heuristics — it <strong>cannot</strong> definitively confirm fraud.</li>
         <li>Model confidence is an internal score, <strong>not</strong> a verified probability of fraud or legitimacy.</li>
+        <li><strong>Suspicious class limitation:</strong> the model correctly identifies only ~68% of suspicious postings.
+            Many suspicious internships are flagged by structural signals (missing company logo, missing requirements)
+            that are not detectable from text alone. A "Suspicious" prediction with no rule-based warnings may be a
+            false positive; a "Legitimate" or "Inconclusive" result does not rule out structural red flags.</li>
         <li>Legitimate postings may trigger warnings; fraudulent ones may evade detection.</li>
         <li>Always cross-verify using official company websites, LinkedIn, and trusted job portals.</li>
         <li>Do not make irreversible decisions (paying fees, sharing documents) based solely on this tool.</li>
-        <li>The model was trained on a limited dataset and may not generalise to all regions or industries.</li>
+        <li>The model was trained on a 900-sample dataset and may not generalise to all regions or industries.</li>
       </ul>
     </div>
     """, unsafe_allow_html=True)
@@ -675,6 +752,8 @@ def main() -> None:
         if metrics:
             st.markdown(f"**Accuracy:** {metrics.get('accuracy', 0)*100:.1f}%")
             st.markdown(f"**F1 (weighted):** {metrics.get('f1', 0)*100:.1f}%")
+            if metrics.get("f1_macro"):
+                st.markdown(f"**F1 (macro):** {metrics.get('f1_macro', 0)*100:.1f}%")
         st.markdown("---")
         st.markdown(
             "<p class='muted'>InternAI uses ML + rule-based heuristics.<br>"
@@ -718,7 +797,7 @@ def main() -> None:
 
         with st.spinner("Analyzing …"):
             # 1. ML classification
-            raw_label, confidence = predict_label(artifact, description)
+            raw_label, confidence, all_probas = predict_label(artifact, description)
 
             # 2. Rule-based warnings
             warning_result = analyze_warnings(description)
@@ -731,7 +810,7 @@ def main() -> None:
 
         # ── ML result ─────────────────────────────────────────────────────────
         st.markdown("### 🤖 ML Classification")
-        render_ml_result(raw_label, confidence, artifact)
+        render_ml_result(raw_label, confidence, artifact, warning_result["count"], all_probas)
 
         # ── Warning indicators ─────────────────────────────────────────────────
         st.markdown("### 🚨 Rule-Based Warning Indicators")
